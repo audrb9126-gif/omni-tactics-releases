@@ -1,0 +1,68 @@
+# Builds Omni-Tactics installers in this PUBLIC repo (free runners) from an encrypted source package kept in
+# the private draft release "build-src". The source stays private: it is AES-encrypted and only decrypted inside the run.
+name: build
+on:
+  workflow_dispatch:
+    inputs:
+      tag: { description: "release tag, e.g. v0.1.4", required: true }
+permissions:
+  contents: write
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            args: ""
+          - os: macos-latest
+            args: "--target aarch64-apple-darwin"
+    runs-on: ${{ matrix.os }}
+    env:
+      RUSTFLAGS: "-Awarnings"          # keep compiler output (code lines) out of the public log
+    steps:
+      - uses: actions/setup-python@v6
+        with: { python-version: "3.12" }
+      - name: get source (encrypted, private draft)
+        shell: bash
+        env: { GH_TOKEN: "${{ github.token }}", SRC_KEY: "${{ secrets.SRC_KEY }}" }
+        run: |
+          gh release download build-src -R "$GITHUB_REPOSITORY" -p src.enc -D "$RUNNER_TEMP"
+          python -m pip install -q cryptography
+          python - <<'EOF'
+          import hashlib, os, tarfile, io
+          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+          b = open(os.path.join(os.environ["RUNNER_TEMP"], "src.enc"), "rb").read()
+          key = hashlib.scrypt(os.environ["SRC_KEY"].encode(), salt=b[:16], n=2**14, r=8, p=1, dklen=32)
+          data = AESGCM(key).decrypt(b[16:28], b[28:], None)
+          tarfile.open(fileobj=io.BytesIO(data)).extractall("src", filter="data")
+          EOF
+      - uses: actions/setup-node@v5
+        with: { node-version: "22" }
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.os == 'macos-latest' && 'aarch64-apple-darwin' || '' }}
+      - run: npm ci --silent
+        working-directory: src/apps/desktop
+      - name: engine bundle + LGPL FFmpeg
+        working-directory: src
+        shell: bash
+        run: |
+          python -m pip install -q -e "engine[build]"
+          python tools/build_engine.py --with-ffmpeg > "$RUNNER_TEMP/engine.log" 2>&1 || { tail -40 "$RUNNER_TEMP/engine.log"; exit 1; }
+          tail -3 "$RUNNER_TEMP/engine.log"
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: src/apps/desktop
+          tagName: ${{ inputs.tag }}
+          releaseCommitish: main
+          releaseName: "Omni-Tactics ${{ inputs.tag }}"
+          releaseBody: "변경 내용은 웹사이트의 변경 이력을 봐 주세요."
+          releaseDraft: false
+          prerelease: false
+          includeUpdaterJson: true
+          args: --config src-tauri/tauri.release.conf.json ${{ matrix.args }}
